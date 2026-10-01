@@ -2,10 +2,12 @@
 /**
  * API 路由与业务逻辑。
  * 错误约定：返回 { error: 消息, ... } ，状态码语义：
- *   400 参数/前置条件错误（含无已发布版本、版本未发布、跳过/撤回/驳回缺原因）
+ *   400 参数/前置条件错误（含无已发布版本、版本未发布、跳过/撤回/驳回缺原因、
+ *       接续缺操作人/目标版本、目标版本不高于当前版本）
  *   404 资源不存在
  *   409 冲突（提示已有结果、版本已发布不可改、撤回时当前状态不允许或下游仍已触发、
- *       复核申请重复/已处置/处置人身份不符、待复核期间跳过或撤回）
+ *       复核申请重复/已处置/处置人身份不符、待复核期间跳过或撤回、
+ *       演出已转只读后的现场操作与再次接续、接续核对冲突——附 conflicts 编号与原因）
  *   422 校验未通过（缺失引用/循环依赖）或前置未触发（受阻，含复核确认时前置失效）
  */
 const { db, withTx } = require('./db');
@@ -23,6 +25,7 @@ class HttpError extends Error {
 
 const ACTION_TEXT = { fired: '已触发', skipped: '已跳过', retracted: '已撤回' };
 const REQUEST_STATUS_TEXT = { pending: '待复核', confirmed: '已确认', cancelled: '已撤销', rejected: '已驳回' };
+const TYPE_TEXT = { light: '灯光', sound: '音效', set: '布景', other: '其他' };
 
 function sanitizeCue(raw) {
   const deps = Array.isArray(raw && raw.deps) ? raw.deps : [];
@@ -78,10 +81,26 @@ function effectiveAction(latest) {
   return latest && latest.action !== 'retracted' ? latest.action : null;
 }
 
-/** 演出与提示的存在性校验（提示须属于演出锁定的版本），供各写操作复用 */
+/**
+ * 只读演出（已接续到修订执行单）拒绝一切现场写操作与再次接续。
+ * 须在事务内调用，与现场操作串行判定。
+ */
+function assertPerfWritable(perf) {
+  if (perf.status === 'readonly') {
+    const cont = db.prepare('SELECT * FROM performance_continuations WHERE from_performance_id = ?').get(perf.id);
+    throw new HttpError(
+      409,
+      `该演出已改用修订执行单并转为只读${cont ? `（接续至演出 #${cont.to_performance_id}）` : ''}，现场操作请在接续演出中进行`,
+      { continued_to: cont ? cont.to_performance_id : null }
+    );
+  }
+}
+
+/** 演出与提示的存在性校验（提示须属于演出锁定的版本），供各写操作复用；只读演出在此统一拒绝 */
 function getPerfCue(performanceId, cueId) {
   const perf = db.prepare('SELECT * FROM performances WHERE id = ?').get(performanceId);
   if (!perf) throw new HttpError(404, '演出不存在');
+  assertPerfWritable(perf);
   const cue = db.prepare('SELECT * FROM cues WHERE id = ? AND version_id = ?').get(cueId, perf.version_id);
   if (!cue) throw new HttpError(404, '该提示不属于此演出使用的版本');
   return { perf, cue };
@@ -142,7 +161,10 @@ route('GET', '/api/shows/:id', (body, p) => {
     'SELECT id, show_id, version_number, status, note, created_at, published_at FROM versions WHERE show_id = ? ORDER BY version_number DESC'
   ).all(show.id);
   const performances = db.prepare(`
-    SELECT p.*, v.version_number FROM performances p
+    SELECT p.*, v.version_number,
+      (SELECT c.from_performance_id FROM performance_continuations c WHERE c.to_performance_id = p.id) AS continued_from,
+      (SELECT c.to_performance_id FROM performance_continuations c WHERE c.from_performance_id = p.id) AS continued_to
+    FROM performances p
     JOIN versions v ON v.id = p.version_id
     WHERE p.show_id = ? ORDER BY p.id DESC
   `).all(show.id);
@@ -257,10 +279,13 @@ route('GET', '/api/performances/:id', (body, p) => {
   if (!perf) throw new HttpError(404, '演出不存在');
 
   const cues = getVersionCues(perf.version_id);
-  // 完整流水（含撤回），按时间升序；返回时倒序（最新在上）
+  // 完整流水（含撤回与承接记录），按时间升序；返回时倒序（最新在上）。
+  // source_event_id 非空 = 承接记录，source_performance_id 标出来源演出
   const events = db.prepare(`
-    SELECT e.*, c.label, c.seq FROM cue_events e
+    SELECT e.*, c.label, c.seq, se.performance_id AS source_performance_id
+    FROM cue_events e
     JOIN cues c ON c.id = e.cue_id
+    LEFT JOIN cue_events se ON se.id = e.source_event_id
     WHERE e.performance_id = ? ORDER BY e.id
   `).all(perf.id);
 
@@ -300,7 +325,31 @@ route('GET', '/api/performances/:id', (body, p) => {
   }
   for (const c of cueStates) c.pending_request = pendingByCue.get(c.id) || null;
 
-  return { performance: perf, cues: cueStates, events: events.slice().reverse(), review_requests: reviewRequests };
+  // 接续关系：from = 本场承接自哪场演出；to = 本场已接续至哪场（转只读后存在）
+  const contFrom = db.prepare(`
+    SELECT c.id, c.from_performance_id, c.operator, c.carried_count, c.created_at,
+           v.version_number AS from_version_number
+    FROM performance_continuations c
+    JOIN performances p ON p.id = c.from_performance_id
+    JOIN versions v ON v.id = p.version_id
+    WHERE c.to_performance_id = ?
+  `).get(perf.id) || null;
+  const contTo = db.prepare(`
+    SELECT c.id, c.to_performance_id, c.operator, c.carried_count, c.created_at,
+           v.version_number AS to_version_number
+    FROM performance_continuations c
+    JOIN performances p ON p.id = c.to_performance_id
+    JOIN versions v ON v.id = p.version_id
+    WHERE c.from_performance_id = ?
+  `).get(perf.id) || null;
+
+  return {
+    performance: perf,
+    cues: cueStates,
+    events: events.slice().reverse(),
+    review_requests: reviewRequests,
+    continuation: { from: contFrom, to: contTo },
+  };
 });
 
 /* ---- 触发 / 跳过 / 撤回（并发安全：BEGIN IMMEDIATE 事务内读最新事件再判定写入） ---- */
@@ -442,8 +491,11 @@ function createReviewRequest(performanceId, cueId, operator) {
   });
 }
 
-/** 取申请并校验属于该演出 */
+/** 取申请并校验属于该演出；只读演出在此统一拒绝（撤销/驳回不经过 getPerfCue） */
 function getReviewRequest(performanceId, requestId) {
+  const perf = db.prepare('SELECT * FROM performances WHERE id = ?').get(performanceId);
+  if (!perf) throw new HttpError(404, '演出不存在');
+  assertPerfWritable(perf);
   const req = db.prepare(
     'SELECT * FROM cue_review_requests WHERE id = ? AND performance_id = ?'
   ).get(requestId, performanceId);
@@ -589,6 +641,195 @@ route('POST', '/api/performances/:id/cues/:cueId/retract', (body, p) => {
   if (!reason) throw new HttpError(400, '撤回必须填写原因');
   return retractEvent(Number(p.id), Number(p.cueId), operator, reason);
 });
+
+/* ---- 现场接续：改用修订执行单 ---- */
+
+/** 接续链：从最早来源到当前演出（含当前，按时间先后），沿 performance_continuations 向上追溯 */
+function continuationChain(performanceId) {
+  const chain = [];
+  const seen = new Set();
+  let curId = performanceId;
+  while (curId != null && !seen.has(curId)) {
+    seen.add(curId);
+    const perf = db.prepare('SELECT * FROM performances WHERE id = ?').get(curId);
+    if (!perf) break;
+    chain.unshift(perf);
+    const cont = db.prepare('SELECT from_performance_id FROM performance_continuations WHERE to_performance_id = ?').get(curId);
+    curId = cont ? cont.from_performance_id : null;
+  }
+  return chain;
+}
+
+/**
+ * 接续链上各提示（按编号对齐）的当前有效结果：链内演出按时间先后归约，
+ * fired/skipped 为有效结果，retracted 清除；承接记录与现场记录同样参与。
+ * 返回 Map: label -> { action, event }
+ */
+function chainEffectiveResults(chain) {
+  const byLabel = new Map();
+  const q = db.prepare(`
+    SELECT e.*, c.label FROM cue_events e
+    JOIN cues c ON c.id = e.cue_id
+    WHERE e.performance_id = ? ORDER BY e.id
+  `);
+  for (const perf of chain) {
+    for (const e of q.all(perf.id)) {
+      if (e.action === 'retracted') byLabel.delete(e.label);
+      else byLabel.set(e.label, { action: e.action, event: e });
+    }
+  }
+  return byLabel;
+}
+
+/** 前置编号集合比较（顺序无关） */
+function sameDepSet(a, b) {
+  if (a.length !== b.length) return false;
+  const sa = [...a].sort();
+  const sb = [...b].sort();
+  return sa.every((x, i) => x === sb[i]);
+}
+
+/**
+ * 接续前核对（须在事务内调用，与现场操作串行判定）：
+ * 1) 链上各演出不得有待复核的触发申请；
+ * 2) 链上有任意触发/跳过/撤回流水、复核申请或承接结果的提示（按编号），
+ *    新版执行单须保留其编号、类型、描述、前置编号集合与复核标记。
+ * 返回冲突数组 [{ label, reason }]，空数组表示可接续。
+ */
+function continuationConflicts(chain, newCues) {
+  const conflicts = [];
+  const seen = new Set();
+  const push = (label, reason) => {
+    const key = `${label}${reason}`;
+    if (seen.has(key)) return;
+    seen.add(key);
+    conflicts.push({ label, reason });
+  };
+  const ids = chain.map((p) => p.id);
+  const ph = ids.map(() => '?').join(',');
+
+  // 待复核申请：接续前必须处置完毕
+  const pendings = db.prepare(`
+    SELECT c.label, r.requested_by FROM cue_review_requests r
+    JOIN cues c ON c.id = r.cue_id
+    WHERE r.status = 'pending' AND r.performance_id IN (${ph})
+    ORDER BY r.id
+  `).all(...ids);
+  for (const r of pendings) {
+    push(r.label, `存在待复核的触发申请（申请人 ${r.requested_by}），须先确认、撤销或驳回`);
+  }
+
+  // 有执行痕迹的提示：其在新版中的定义须与原样保留
+  const touched = db.prepare(`
+    SELECT * FROM cues WHERE id IN (
+      SELECT cue_id FROM cue_events WHERE performance_id IN (${ph})
+      UNION
+      SELECT cue_id FROM cue_review_requests WHERE performance_id IN (${ph})
+    )
+  `).all(...ids, ...ids);
+
+  const newByLabel = new Map(newCues.map((c) => [c.label, c]));
+  for (const t of touched) {
+    const nc = newByLabel.get(t.label);
+    if (!nc) {
+      push(t.label, '新版执行单缺少该编号，无法承接其执行痕迹');
+      continue;
+    }
+    if (nc.type !== t.type) {
+      push(t.label, `类型不一致（当前「${TYPE_TEXT[t.type] || t.type}」，新版「${TYPE_TEXT[nc.type] || nc.type}」）`);
+    }
+    if (nc.description !== t.description) {
+      push(t.label, '描述不一致（新版改动了该提示的描述）');
+    }
+    const oldDeps = JSON.parse(t.deps);
+    if (!sameDepSet(oldDeps, nc.deps)) {
+      push(t.label, `前置编号集合不一致（当前 ${oldDeps.join('、') || '无'}，新版 ${nc.deps.join('、') || '无'}）`);
+    }
+    if (Number(nc.needs_review) !== Number(t.needs_review)) {
+      push(t.label, `复核标记不一致（当前${t.needs_review ? '需' : '无需'}双人复核，新版${nc.needs_review ? '需' : '无需'}）`);
+    }
+  }
+  return conflicts;
+}
+
+/**
+ * 生成接续演出：原演出转只读（仍绑定原快照），新演出使用目标版本并继承链上有效结果。
+ * 承接结果写入带 source_event_id 的记录（标出来源事件，不伪造再次触发）；
+ * 未执行提示不做任何记录，其状态按新版依赖计算。全部判定与写入在同一事务内完成，
+ * 与现场操作串行；核对冲突时整体回滚，原演出保持可操作且不产生接续记录。
+ */
+function continuePerformance(performanceId, body) {
+  const operator = String(body.operator || '').trim().slice(0, 50);
+  if (!operator) throw new HttpError(400, '请填写操作人');
+  if (body.version_id == null) throw new HttpError(400, '请指定目标版本 version_id');
+
+  return withTx(() => {
+    const perf = db.prepare('SELECT * FROM performances WHERE id = ?').get(performanceId);
+    if (!perf) throw new HttpError(404, '演出不存在');
+    // 已转只读的演出不能再次接续：多次接续只允许从当前可操作演出发起
+    assertPerfWritable(perf);
+
+    const curVersion = getVersion(perf.version_id);
+    const version = db.prepare('SELECT * FROM versions WHERE id = ? AND show_id = ?')
+      .get(body.version_id, perf.show_id);
+    if (!version) throw new HttpError(404, '目标版本不存在或不属于本场次');
+    if (version.status !== 'published') {
+      throw new HttpError(400, `目标版本 v${version.version_number} 尚未发布，不能用于接续`);
+    }
+    if (version.version_number <= curVersion.version_number) {
+      throw new HttpError(400, `目标版本须高于当前版本（当前 v${curVersion.version_number}，目标 v${version.version_number}）`);
+    }
+
+    const chain = continuationChain(perf.id);
+    const newCues = getVersionCues(version.id);
+    const conflicts = continuationConflicts(chain, newCues);
+    if (conflicts.length) {
+      const summary = conflicts.slice(0, 5).map((c) => `${c.label}：${c.reason}`).join('；');
+      throw new HttpError(
+        409,
+        `无法接续到 v${version.version_number}，共 ${conflicts.length} 处冲突：${summary}${conflicts.length > 5 ? '；…' : ''}`,
+        { conflicts }
+      );
+    }
+
+    // 新演出绑定目标版本快照；名称缺省沿用原演出
+    const name = String(body.name || '').trim().slice(0, 100) || perf.name;
+    const info = db.prepare('INSERT INTO performances (show_id, version_id, name, started_by) VALUES (?,?,?,?)')
+      .run(perf.show_id, version.id, name, operator);
+    const newPerfId = Number(info.lastInsertRowid);
+
+    // 原演出转为只读（version_id 不变，仍绑定原快照，流水照常可查）
+    db.prepare("UPDATE performances SET status = 'readonly' WHERE id = ?").run(perf.id);
+
+    // 继承链上各提示的当前有效结果：按编号对齐到新版提示，写入承接记录并标出来源事件
+    const effective = chainEffectiveResults(chain);
+    const newCueByLabel = new Map(newCues.map((c) => [c.label, c]));
+    const insEvent = db.prepare(
+      'INSERT INTO cue_events (performance_id, cue_id, action, operator, reason, source_event_id) VALUES (?,?,?,?,?,?)'
+    );
+    const carried = [];
+    for (const [label, r] of effective) {
+      const target = newCueByLabel.get(label);
+      if (!target) continue; // 核对已保证编号存在，防御性跳过
+      const src = r.event;
+      const reason = `承接自演出 #${src.performance_id} 的${ACTION_TEXT[r.action]}结果（原操作人 ${src.operator}，时间 ${src.created_at}）`;
+      const evInfo = insEvent.run(newPerfId, target.id, r.action, operator, reason, src.id);
+      carried.push({ label, action: r.action, source_event_id: src.id, event_id: Number(evInfo.lastInsertRowid) });
+    }
+
+    const contInfo = db.prepare(
+      'INSERT INTO performance_continuations (from_performance_id, to_performance_id, operator, carried_count) VALUES (?,?,?,?)'
+    ).run(perf.id, newPerfId, operator, carried.length);
+
+    return {
+      performance: db.prepare('SELECT * FROM performances WHERE id = ?').get(newPerfId),
+      continuation: db.prepare('SELECT * FROM performance_continuations WHERE id = ?').get(Number(contInfo.lastInsertRowid)),
+      carried,
+    };
+  });
+}
+
+route('POST', '/api/performances/:id/continue', (body, p) => continuePerformance(Number(p.id), body));
 
 /* ---------------- 分发 ---------------- */
 

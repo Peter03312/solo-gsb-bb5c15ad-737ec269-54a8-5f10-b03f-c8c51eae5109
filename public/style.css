@@ -89,6 +89,13 @@ th { color: var(--muted); font-weight: 500; font-size: 13px; }
 .badge.draft { background: #3d3417; color: var(--pending); }
 .badge.published { background: #14342a; color: var(--fired); }
 .badge.review { background: #2e2a4a; color: #b9a7f2; }
+.badge.readonly { background: #3a3f4d; color: var(--skipped); }
+.badge.active { background: #14342a; color: var(--fired); }
+.badge.carried { background: #2e2a4a; color: #b9a7f2; }
+
+/* 接续面板 */
+.continue-panel { border-color: var(--accent); margin-top: 10px; }
+.continue-panel label { display: inline-flex; align-items: center; gap: 6px; font-size: 13px; color: var(--muted); }
 
 .status { font-weight: 700; font-size: 13px; }
 .status.pending { color: var(--pending); }

@@ -49,19 +49,36 @@ CREATE TABLE IF NOT EXISTS cues (
 );
 CREATE INDEX IF NOT EXISTS idx_cues_version ON cues(version_id, seq);
 
--- 每场演出：锁定一个已发布版本，独立记录
+-- 每场演出：锁定一个已发布版本，独立记录；
+-- status：active 可现场操作；readonly 已接续到修订执行单，拒绝一切现场操作
 CREATE TABLE IF NOT EXISTS performances (
   id          INTEGER PRIMARY KEY AUTOINCREMENT,
   show_id     INTEGER NOT NULL REFERENCES shows(id),
   version_id  INTEGER NOT NULL REFERENCES versions(id),
   name        TEXT NOT NULL DEFAULT '',
   started_by  TEXT NOT NULL DEFAULT '',
-  started_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+  started_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  status      TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active','readonly'))
+);
+
+-- 演出接续：现场改用修订执行单时，由原演出（转只读）接续生成新演出。
+-- 每场演出至多作为来源（from）与目标（to）各出现一次，接续关系成链可查
+CREATE TABLE IF NOT EXISTS performance_continuations (
+  id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+  from_performance_id INTEGER NOT NULL REFERENCES performances(id),
+  to_performance_id   INTEGER NOT NULL REFERENCES performances(id),
+  operator            TEXT NOT NULL,
+  carried_count       INTEGER NOT NULL DEFAULT 0,
+  created_at          TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  UNIQUE (from_performance_id),
+  UNIQUE (to_performance_id)
 );
 
 -- 执行流水：触发 / 跳过 / 撤回 全量留痕；同一演出同一提示的"当前有效结果"
 -- 由最新一条事件推导（retracted 表示已撤回、当前无有效结果），
--- 并发一致性由 BEGIN IMMEDIATE 事务内"读最新事件→判定→写入"保证
+-- 并发一致性由 BEGIN IMMEDIATE 事务内"读最新事件→判定→写入"保证。
+-- source_event_id 非空表示该条为"承接记录"：演出接续时从来源演出的有效结果
+-- 复制而来（指向来源事件，可溯源），与现场触发/跳过明确区分，不伪造再次触发
 CREATE TABLE IF NOT EXISTS cue_events (
   id             INTEGER PRIMARY KEY AUTOINCREMENT,
   performance_id INTEGER NOT NULL REFERENCES performances(id) ON DELETE CASCADE,
@@ -69,7 +86,8 @@ CREATE TABLE IF NOT EXISTS cue_events (
   action         TEXT NOT NULL CHECK (action IN ('fired','skipped','retracted')),
   operator       TEXT NOT NULL,
   reason         TEXT,
-  created_at     TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+  created_at     TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  source_event_id INTEGER REFERENCES cue_events(id)
 );
 CREATE INDEX IF NOT EXISTS idx_cue_events_perf ON cue_events(performance_id, cue_id, id);
 
@@ -136,6 +154,32 @@ function migrateCuesNeedsReviewIfNeeded() {
 }
 
 migrateCuesNeedsReviewIfNeeded();
+
+/**
+ * 旧库迁移：早期 performances 表无 status 列。检测后补列，
+ * 既有演出默认 'active'（可操作）。新库此函数为空操作。
+ */
+function migratePerformancesStatusIfNeeded() {
+  const cols = db.prepare('PRAGMA table_info(performances)').all();
+  if (cols.some((c) => c.name === 'status')) return;
+  db.exec("ALTER TABLE performances ADD COLUMN status TEXT NOT NULL DEFAULT 'active'");
+  console.log('[init] 已迁移 performances 表：新增 status 列（既有演出默认 active）');
+}
+
+migratePerformancesStatusIfNeeded();
+
+/**
+ * 旧库迁移：早期 cue_events 表无 source_event_id 列（承接记录溯源）。
+ * 检测后补列，既有流水均为现场记录（NULL）。新库此函数为空操作。
+ */
+function migrateCueEventsSourceIfNeeded() {
+  const cols = db.prepare('PRAGMA table_info(cue_events)').all();
+  if (cols.some((c) => c.name === 'source_event_id')) return;
+  db.exec('ALTER TABLE cue_events ADD COLUMN source_event_id INTEGER REFERENCES cue_events(id)');
+  console.log('[init] 已迁移 cue_events 表：新增 source_event_id 列（承接记录溯源）');
+}
+
+migrateCueEventsSourceIfNeeded();
 
 /** 事务包装：BEGIN IMMEDIATE 保证写操作串行，冲突时整体回滚 */
 function withTx(fn) {
