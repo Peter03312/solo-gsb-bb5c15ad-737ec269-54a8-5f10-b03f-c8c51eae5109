@@ -89,6 +89,9 @@ th { color: var(--muted); font-weight: 500; font-size: 13px; }
 .badge.draft { background: #3d3417; color: var(--pending); }
 .badge.published { background: #14342a; color: var(--fired); }
 .badge.review { background: #2e2a4a; color: #b9a7f2; }
+.badge.active { background: #14342a; color: var(--fired); }
+.badge.readonly { background: #2b2f3a; color: var(--muted); }
+.badge.carried { background: #173a44; color: #6fc6d8; margin-left: 4px; }
 
 .status { font-weight: 700; font-size: 13px; }
 .status.pending { color: var(--pending); }
@@ -182,3 +185,38 @@ th { color: var(--muted); font-weight: 500; font-size: 13px; }
 .review-pending-text { color: #b9a7f2; font-weight: 600; }
 .grid-2 { display: grid; grid-template-columns: 1fr 300px; gap: 16px; align-items: start; }
 @media (max-width: 860px) { .grid-2 { grid-template-columns: 1fr; } }
+
+/* 接续关系 */
+.continuation-banner {
+  display: flex; flex-wrap: wrap; gap: 8px;
+  margin: 0 0 14px;
+}
+.chain-chip {
+  display: inline-block; border-radius: 8px; padding: 8px 12px;
+  font-size: 13px; border: 1px solid var(--border); background: var(--panel);
+}
+.chain-chip.from { border-color: #2c5b66; background: #122c33; }
+.chain-chip.to { border-color: #3a4a2c; background: #232f17; }
+
+.continue-panel { border-left: 4px solid #6fc6d8; margin-bottom: 16px; }
+.continue-panel.disabled { border-left-color: var(--border); opacity: .85; }
+.continue-panel select, .continue-panel input { font-size: 13px; }
+.hint-table-wrap { overflow-x: auto; margin-top: 8px; }
+.hint-table { font-size: 13px; }
+.hint-table td, .hint-table th { padding: 5px 8px; }
+.hint-flag {
+  display: inline-block; border-radius: 4px; padding: 1px 7px;
+  margin: 1px 4px 1px 0; font-size: 12px;
+  background: var(--panel-2); border: 1px solid var(--border);
+}
+.hint-flag.flag-fired { color: var(--fired); border-color: var(--fired); }
+.hint-flag.flag-skipped { color: var(--skipped); }
+.hint-flag.flag-retracted { color: var(--retracted); }
+.hint-flag.flag-review { color: #b9a7f2; border-color: #b9a7f2; }
+.hint-flag.flag-carried { color: #6fc6d8; border-color: #6fc6d8; }
+
+.readonly-note {
+  background: #262a35; border: 1px solid var(--border); border-left: 4px solid var(--muted);
+  border-radius: 8px; padding: 10px 14px; margin-bottom: 10px; font-size: 13px;
+}
+.carried-text { color: #6fc6d8; font-weight: 600; }

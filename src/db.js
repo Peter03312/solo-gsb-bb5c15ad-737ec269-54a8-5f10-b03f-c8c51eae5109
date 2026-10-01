@@ -50,18 +50,26 @@ CREATE TABLE IF NOT EXISTS cues (
 CREATE INDEX IF NOT EXISTS idx_cues_version ON cues(version_id, seq);
 
 -- 每场演出：锁定一个已发布版本，独立记录
+-- status: active 可现场操作；readonly 为已接续的原演出（保留原快照，仅可回看）
+-- continued_from_performance_id: 接续演出指向其来源演出（沿此链可追溯全部历史）
 CREATE TABLE IF NOT EXISTS performances (
   id          INTEGER PRIMARY KEY AUTOINCREMENT,
   show_id     INTEGER NOT NULL REFERENCES shows(id),
   version_id  INTEGER NOT NULL REFERENCES versions(id),
   name        TEXT NOT NULL DEFAULT '',
   started_by  TEXT NOT NULL DEFAULT '',
-  started_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+  started_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  status      TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active','readonly')),
+  continued_from_performance_id INTEGER REFERENCES performances(id),
+  continued_at TEXT,
+  continued_by TEXT
 );
 
 -- 执行流水：触发 / 跳过 / 撤回 全量留痕；同一演出同一提示的"当前有效结果"
 -- 由最新一条事件推导（retracted 表示已撤回、当前无有效结果），
 -- 并发一致性由 BEGIN IMMEDIATE 事务内"读最新事件→判定→写入"保证
+-- source: manual 现场操作；carried 接续时从来源演出承接的有效结果（非再次触发，
+--   carried_* 列指向来源事件 / 来源演出，原流水在来源演出中仍可查）
 CREATE TABLE IF NOT EXISTS cue_events (
   id             INTEGER PRIMARY KEY AUTOINCREMENT,
   performance_id INTEGER NOT NULL REFERENCES performances(id) ON DELETE CASCADE,
@@ -69,7 +77,10 @@ CREATE TABLE IF NOT EXISTS cue_events (
   action         TEXT NOT NULL CHECK (action IN ('fired','skipped','retracted')),
   operator       TEXT NOT NULL,
   reason         TEXT,
-  created_at     TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+  created_at     TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  source         TEXT NOT NULL DEFAULT 'manual' CHECK (source IN ('manual','carried')),
+  carried_from_performance_id INTEGER REFERENCES performances(id),
+  carried_from_event_id       INTEGER
 );
 CREATE INDEX IF NOT EXISTS idx_cue_events_perf ON cue_events(performance_id, cue_id, id);
 
@@ -137,6 +148,50 @@ function migrateCuesNeedsReviewIfNeeded() {
 
 migrateCuesNeedsReviewIfNeeded();
 
+/**
+ * 旧库迁移：performances 表新增接续相关列
+ * （status 读写状态、continued_from_performance_id 来源演出、continued_at/by 接续时间与操作人）。
+ * 既有演出均为现场启动、可操作，status 默认 active。新库此函数为空操作。
+ */
+function migratePerformancesContinuationIfNeeded() {
+  const cols = db.prepare('PRAGMA table_info(performances)').all();
+  const has = (name) => cols.some((c) => c.name === name);
+  if (!has('status')) {
+    db.exec("ALTER TABLE performances ADD COLUMN status TEXT NOT NULL DEFAULT 'active'");
+  }
+  if (!has('continued_from_performance_id')) {
+    db.exec('ALTER TABLE performances ADD COLUMN continued_from_performance_id INTEGER REFERENCES performances(id)');
+  }
+  if (!has('continued_at')) db.exec('ALTER TABLE performances ADD COLUMN continued_at TEXT');
+  if (!has('continued_by')) db.exec('ALTER TABLE performances ADD COLUMN continued_by TEXT');
+  if (!has('status') || !has('continued_from_performance_id') || !has('continued_at') || !has('continued_by')) {
+    console.log('[init] 已迁移 performances 表：新增接续关系列（status / continued_from_performance_id / continued_at / continued_by，既有演出默认可操作）');
+  }
+}
+
+migratePerformancesContinuationIfNeeded();
+
+/**
+ * 旧库迁移：cue_events 表新增承接来源列（source / carried_from_performance_id /
+ * carried_from_event_id）。既有流水均为现场手动操作，source 默认 manual。新库为空操作。
+ */
+function migrateCueEventsCarryIfNeeded() {
+  const cols = db.prepare('PRAGMA table_info(cue_events)').all();
+  const has = (name) => cols.some((c) => c.name === name);
+  if (!has('source')) {
+    db.exec("ALTER TABLE cue_events ADD COLUMN source TEXT NOT NULL DEFAULT 'manual'");
+  }
+  if (!has('carried_from_performance_id')) {
+    db.exec('ALTER TABLE cue_events ADD COLUMN carried_from_performance_id INTEGER REFERENCES performances(id)');
+  }
+  if (!has('carried_from_event_id')) db.exec('ALTER TABLE cue_events ADD COLUMN carried_from_event_id INTEGER');
+  if (!has('source') || !has('carried_from_performance_id') || !has('carried_from_event_id')) {
+    console.log('[init] 已迁移 cue_events 表：新增承接来源列（source / carried_from_performance_id / carried_from_event_id，既有流水默认手动）');
+  }
+}
+
+migrateCueEventsCarryIfNeeded();
+
 /** 事务包装：BEGIN IMMEDIATE 保证写操作串行，冲突时整体回滚 */
 function withTx(fn) {
   db.exec('BEGIN IMMEDIATE');
@@ -159,11 +214,14 @@ function seedDemoIfEmpty() {
   const insertVersion = db.prepare(
     "INSERT INTO versions (show_id, version_number, status, note, published_at) VALUES (?,?,?,?,strftime('%Y-%m-%dT%H:%M:%fZ','now'))"
   );
-  const insertDraft = db.prepare(
-    'INSERT INTO versions (show_id, version_number, status, note) VALUES (?,?,?,?)'
-  );
   const insertCue = db.prepare(
     'INSERT INTO cues (version_id, seq, label, type, description, deps, needs_review) VALUES (?,?,?,?,?,?,?)'
+  );
+  const insertPerformance = db.prepare(
+    'INSERT INTO performances (show_id, version_id, name, started_by) VALUES (?,?,?,?)'
+  );
+  const insertEvent = db.prepare(
+    "INSERT INTO cue_events (performance_id, cue_id, action, operator, reason) VALUES (?,?,?,?,?)"
   );
 
   withTx(() => {
@@ -182,9 +240,20 @@ function seedDemoIfEmpty() {
     const v1 = Number(insertVersion.run(showId, 1, 'published', '首演版').lastInsertRowid);
     demoCues.forEach((c, i) => insertCue.run(v1, i + 1, c[0], c[1], c[2], c[3], c[4]));
 
-    const v2 = Number(insertDraft.run(showId, 2, 'draft', '排演修改中').lastInsertRowid);
-    demoCues.forEach((c, i) => insertCue.run(v2, i + 1, c[0], c[1], c[2], c[3], c[4]));
+    // v2 已发布：新增 S3 并调整 L2 描述（编号、类型、前置、复核标记均保留），可作为接续目标
+    const v2 = Number(insertVersion.run(showId, 2, 'published', '现场修订版：新增雨声 S3').lastInsertRowid);
+    demoCues.forEach((c, i) => {
+      const desc = c[0] === 'L2' ? '追光打在主角位（提亮）' : c[2];
+      insertCue.run(v2, i + 1, c[0], c[1], desc, c[3], c[4]);
+    });
     insertCue.run(v2, demoCues.length + 1, 'S3', 'sound', '雨声渐入（新增）', '["S2"]', 0);
+
+    // 一场进行中的演出（v1）：L1 已触发、S1 已跳过，其余未执行，可直接体验接续到 v2
+    const perfId = Number(insertPerformance.run(showId, v1, '9月30日 晚场（进行中）', '王导').lastInsertRowid);
+    const cueIdByLabel = (versionId, label) =>
+      db.prepare('SELECT id FROM cues WHERE version_id = ? AND label = ?').get(versionId, label).id;
+    insertEvent.run(perfId, cueIdByLabel(v1, 'L1'), 'fired', '张三', null);
+    insertEvent.run(perfId, cueIdByLabel(v1, 'S1'), 'skipped', '李四', '音乐设备故障，跳过开场音乐');
   });
 
   console.log('[init] 已写入演示数据（SEED_DEMO=0 可关闭）');
